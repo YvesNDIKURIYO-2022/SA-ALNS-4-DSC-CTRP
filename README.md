@@ -1,8 +1,3 @@
-# Updated README for `SA-ALNS-4-DSC-CTRP`
-
-The README is good but has drifted from the current manuscript in five places. Below is the updated `README.md`, followed by a table of what changed and why.
-
-```markdown
 # SA-ALNS for DSC-CTRP
 
 **Stability-Aware Adaptive Large Neighborhood Search for the Dynamic Stability-Constrained Container-Tanker Routing Problem**
