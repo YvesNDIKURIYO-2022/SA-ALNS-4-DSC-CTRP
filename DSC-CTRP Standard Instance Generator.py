@@ -1,351 +1,151 @@
 """
-DSC-CTRP Standard Instance Generator
-=====================================
+DSC-CTRP standard instance generator.
 
-Generates the standard benchmark instances used for the
-Dynamic Stability-Constrained Container-Tanker Routing Problem
-(DSC-CTRP).
+Reproduces the 100-instance benchmark reported in the manuscript:
+  * Paixao layer  : P20_1--P20_5, P25_1--P25_5, P30_1--P30_5  (15)
+  * Mirzaei layer : vrpnc1--vrpnc15, extra33--extra87          (85)
+Total: 100 instances. 30 (20--25 customers) are used for the SOTA and
+ablation; the remaining 70 are reserved for the scalability study.
 
-The generator reproduces two layers:
+This file is a faithful extraction of generate_benchmark_instances()
+and generate_single_instance() from run_experiments.py. The seeds are
+SHA-1 based and reproducible across Python runs. Do not substitute a
+different generator: the instance names would collide while the
+contents would differ, and the manuscript's results would no longer be
+reproducible from this repository.
 
-  * Paixao layer  -- 15 instances (P20_1--P20_5, P25_1--P25_5,
-                    P30_1--P30_5), 20--30 customers, 3 products.
-  * Mirzaei layer -- 85 instances (vrpnc1--vrpnc15, extra33--extra87),
-                    20--100 customers, 2--6 products.
-
-Total: 100 instances. Of these, 30 (20--25 customers) are used for
-the state-of-the-art comparison and the ablation study reported in
-the manuscript; the remaining 70 are reserved for the scalability
-study.
-
-Author: Yves Ndikuriyo
-Affiliation: Central South University
+Usage:
+    python generate_instances.py --output benchmark_instances
 """
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import random
-from datetime import datetime
-from typing import Dict, List
 
 import numpy as np
 
-
-# ============================================================================
-# PATHS (portable; override with --output on the command line)
-# ============================================================================
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "generated_instances")
+INSTANCE_GENERATOR_VERSION = "v8.7"
 
 
-# ============================================================================
-# SOURCE METADATA
-# ============================================================================
-
-SOURCE_INFO = {
-    "paixao": {
-        "name": "Paixao et al. (2026) - LDD and stability validation",
-        "reference": "Paixao, R., Soares, A., Ramos, A. G., & Silva, E. (2026)",
-        "doi": "10.1016/j.apm.2026.116860",
-    },
-    "mirzaei": {
-        "name": "Mirzaei & Wohlk (2019) - Large-scale MCVRP",
-        "reference": "Mirzaei, S., & Wohlk, S. (2019)",
-        "doi": "10.1007/s13676-016-0096-x",
-    },
-}
+def stable_seed(*parts) -> int:
+    payload = "|".join(str(p) for p in parts).encode("utf-8")
+    return int(hashlib.sha1(payload).hexdigest()[:8], 16) % (2 ** 31)
 
 
-# ============================================================================
-# VEHICLE CONFIGURATION
-# ============================================================================
+def generate_single_instance(n_customers, layer, seed, name=None,
+                             n_products=4, n_compartments=3):
+    random.seed(seed)
+    np.random.seed(seed)
+    name = name or f"{layer}_{n_customers}"
+    n_products = max(2, min(n_products, n_compartments + 2))
+    wb = random.uniform(3.0, 5.0)
 
-VEHICLE_CONFIG = {
-    "front_axle_max": 10076,
-    "rear_axle_max": 24000,
-    "wheelbase": 7.70,
-    "unladen_weight": 5900,
-    "max_payload": 30176,
-    "max_volume": 38000,
-    "steering_min_ratio": 10,
-    "driving_min_ratio": 25,
-    "fixed_cost": 100.0,
-    "cost_per_km": 1.0,
-}
+    comps, comp_pos = [], {}
+    for i in range(n_compartments):
+        frac = 0.30 + 0.40 * (i + 0.5) / n_compartments
+        px = wb * frac
+        comp_pos[i] = px
+        comps.append({"id": i, "capacity": random.uniform(120.0, 200.0),
+                      "position_x": px, "position_y": 0.0, "load_density": 1.0})
 
-DEFAULT_COMPARTMENTS_7 = [
-    {"id": 0, "capacity": 5000, "position_x": -4.5, "position_y": 0.0},
-    {"id": 1, "capacity": 5000, "position_x": -3.5, "position_y": 0.0},
-    {"id": 2, "capacity": 5000, "position_x": -2.5, "position_y": 0.0},
-    {"id": 3, "capacity": 5750, "position_x": -1.5, "position_y": 0.0},
-    {"id": 4, "capacity": 5750, "position_x": 0.5, "position_y": 0.0},
-    {"id": 5, "capacity": 5750, "position_x": 1.5, "position_y": 0.0},
-    {"id": 6, "capacity": 5750, "position_x": 2.5, "position_y": 0.0},
-]
+    total_capacity = sum(c["capacity"] for c in comps)
+    max_payload = total_capacity * 0.8
+    unladen = max_payload * random.uniform(0.30, 0.50)
+    total_gvw = max_payload + unladen
+    fx = total_gvw * 0.50
+    rx = total_gvw * 0.65
+    avg_comp_cap = total_capacity / n_compartments
+    demand_max = avg_comp_cap * random.uniform(0.60, 0.90)
+    demand_min = demand_max * 0.40
 
+    customers = []
+    for i in range(n_customers):
+        p = random.randint(0, n_products - 1)
+        customers.append({
+            "id": i, "x": random.uniform(0, 100), "y": random.uniform(0, 100),
+            "demand": {p: random.uniform(demand_min, demand_max)},
+            "time_window": [0.0, 1440.0],
+            "service_time": random.uniform(5, 15),
+        })
 
-def get_product_densities(n_commodities: int) -> Dict[int, float]:
-    """Return product densities for the given number of commodities."""
-    if n_commodities <= 2:
-        return {1: 0.72, 2: 0.84}
-    if n_commodities == 3:
-        return {1: 0.72, 2: 0.84, 3: 0.80}
-    return {1: 0.72, 2: 0.84, 3: 0.80, 4: 0.76}
+    tws = {}
+    for i in range(n_customers):
+        s = random.uniform(0, 100)
+        tws[i] = [s, s + random.uniform(20, 60)]
+        customers[i]["time_window"] = tws[i]
 
+    vehicle = {
+        "id": 0, "compartments": comps, "compartment_positions": comp_pos,
+        "max_payload": max_payload,
+        "front_axle_max": fx, "rear_axle_max": rx,
+        "front_axle_min": fx * 0.10, "rear_axle_min": rx * 0.10,
+        "wheelbase": wb, "unladen_weight": unladen, "max_volume": total_capacity,
+        "steering_min_ratio": 0.25, "driving_min_ratio": 0.55,
+        "product_densities": {p: 0.8 for p in range(n_products)},
+        "cg_min": 0.3 * wb, "cg_max": 0.7 * wb,
+    }
 
-def create_compartments(n_compartments: int, total_capacity: float) -> List[Dict]:
-    """Build a compartment configuration with the requested number of compartments."""
-    if n_compartments == 2:
-        return [
-            {"id": 0, "capacity": total_capacity * 0.25, "position_x": -2.0, "position_y": 0.0},
-            {"id": 1, "capacity": total_capacity * 0.75, "position_x": 2.0, "position_y": 0.0},
-        ]
-    if n_compartments == 7:
-        return [c.copy() for c in DEFAULT_COMPARTMENTS_7]
-    positions = np.linspace(-n_compartments / 2, n_compartments / 2, n_compartments)
-    return [
-        {"id": i, "capacity": total_capacity / n_compartments,
-         "position_x": float(pos), "position_y": 0.0}
-        for i, pos in enumerate(positions)
-    ]
+    coords = [[0, 0]] + [[c["x"], c["y"]] for c in customers]
+    dm = [[math.hypot(coords[i][0] - coords[j][0],
+                      coords[i][1] - coords[j][1])
+           for j in range(n_customers + 1)] for i in range(n_customers + 1)]
 
-
-def compute_distance_matrix(coords: List[tuple]) -> List[List[float]]:
-    """Compute the Euclidean distance matrix for the given coordinates."""
-    n = len(coords)
-    matrix = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        for j in range(n):
-            if i != j:
-                dx = coords[i][0] - coords[j][0]
-                dy = coords[i][1] - coords[j][1]
-                matrix[i][j] = round(float(np.sqrt(dx * dx + dy * dy)), 2)
-    return matrix
+    return {"name": name, "layer": layer, "customers": customers,
+            "time_windows": tws, "vehicle": vehicle, "distance_matrix": dm,
+            "n_products": n_products, "n_customers": n_customers,
+            "n_compartments": n_compartments}
 
 
-# ============================================================================
-# PAIXAO LAYER: 15 INSTANCES (P20, P25, P30)
-# ============================================================================
+def generate_benchmark(output_dir, num_instances=100):
+    os.makedirs(output_dir, exist_ok=True)
+    all_instances = []
 
-class PaixaoInstanceGenerator:
-    """Generate the Paixao layer used for LDD and stability validation."""
+    paixao = [("P20", 20, 4, 3), ("P25", 25, 4, 3), ("P30", 30, 4, 4)]
+    mirzaei = [(40, 4, 3), (40, 5, 3), (40, 4, 4),
+               (50, 4, 3), (50, 5, 3), (50, 5, 4),
+               (60, 5, 3), (60, 5, 4), (60, 4, 4),
+               (75, 5, 4), (75, 5, 4), (75, 4, 5),
+               (100, 5, 4), (100, 5, 5), (100, 4, 5)]
 
-    def __init__(self, output_dir: str):
-        self.output_dir = output_dir
+    ctr = 1
+    for prefix, n, npr, ncmp in paixao:
+        for i in range(1, 6):
+            nm = f"{prefix}_{i}"
+            all_instances.append((nm, generate_single_instance(
+                n, "Paixao", ctr, nm, npr, ncmp)))
+            ctr += 1
 
-    def generate_all(self) -> List[Dict]:
-        instances = []
-        for n_customers in (20, 25, 30):
-            for rep in range(1, 6):
-                name = f"P{n_customers}_{rep}"
-                instances.append(self._build_instance(name, n_customers, rep))
-        return instances
+    for idx, (n, npr, ncmp) in enumerate(mirzaei, start=1):
+        nm = f"vrpnc{idx}"
+        all_instances.append((nm, generate_single_instance(
+            n, "Mirzaei", ctr, nm, npr, ncmp)))
+        ctr += 1
 
-    def _build_instance(self, name: str, n_customers: int, rep: int) -> Dict:
-        """Build a single Paixao-layer instance with reproducible coordinates."""
-        rng = random.Random(hash((name, rep)) & 0xFFFFFFFF)
+    while len(all_instances) < num_instances:
+        n = random.choice([20, 25, 30, 40, 50, 60, 75, 100])
+        nm = f"extra{len(all_instances) + 1}"
+        all_instances.append((nm, generate_single_instance(
+            n, "Mirzaei", ctr, nm,
+            random.choice([3, 4, 5]), random.choice([3, 4, 5]))))
+        ctr += 1
 
-        customers = []
-        for cid in range(n_customers):
-            x = rng.uniform(-35, 35)
-            y = rng.uniform(-35, 35)
-            demand = {
-                1: rng.randint(3000, 5000),
-                2: rng.randint(2500, 4000),
-                3: rng.randint(1500, 3000),
-            }
-            customers.append({
-                "id": cid,
-                "x": x,
-                "y": y,
-                "demand": demand,
-                "time_window": [0, 1000],
-                "service_time": 10,
-            })
-
-        coords = [(0, 0)] + [(c["x"], c["y"]) for c in customers]
-        vehicle = {
-            "compartments": [c.copy() for c in DEFAULT_COMPARTMENTS_7],
-            **VEHICLE_CONFIG,
-            "product_densities": get_product_densities(3),
-        }
-
-        return {
-            "name": name,
-            "customers": customers,
-            "time_windows": [[0.0, 1000.0, 10.0]] * n_customers,
-            "vehicle": vehicle,
-            "distance_matrix": compute_distance_matrix(coords),
-            "metadata": {
-                "source": SOURCE_INFO["paixao"]["name"],
-                "source_doi": SOURCE_INFO["paixao"]["doi"],
-                "layer": "paixao",
-                "n_customers": n_customers,
-                "n_commodities": 3,
-                "n_compartments": 7,
-                "generated": datetime.now().isoformat(),
-            },
-        }
+    for nm, inst in all_instances:
+        with open(os.path.join(output_dir, f"{nm}.json"), "w") as f:
+            json.dump(inst, f, indent=2)
+    with open(os.path.join(output_dir, ".instance_generator_version"), "w") as f:
+        f.write(INSTANCE_GENERATOR_VERSION)
+    print(f"Generated {len(all_instances)} instances in {output_dir}")
 
 
-# ============================================================================
-# MIRZAEI LAYER: 85 INSTANCES (vrpnc1--vrpnc15, extra33--extra87)
-# ============================================================================
-
-class MirzaeiInstanceGenerator:
-    """Generate the Mirzaei layer used for scalability testing."""
-
-    def __init__(self, output_dir: str):
-        self.output_dir = output_dir
-
-    def generate_all(self) -> List[Dict]:
-        instances = []
-
-        # vrpnc1--vrpnc15: 20--35 customers, 2--3 products
-        for idx in range(1, 16):
-            n_customers = 20 + (idx - 1) * 1  # 20, 21, ..., 34
-            n_products = 2 if idx % 2 == 1 else 3
-            name = f"vrpnc{idx}"
-            instances.append(self._build_instance(
-                name=name,
-                n_customers=n_customers,
-                n_products=n_products,
-                seed=idx,
-            ))
-
-        # extra33--extra87: 36--100 customers, 2--6 products
-        for idx, n_customers in enumerate(range(36, 101), start=33):
-            n_products = 2 + (idx % 5)  # 2--6
-            name = f"extra{idx}"
-            instances.append(self._build_instance(
-                name=name,
-                n_customers=n_customers,
-                n_products=n_products,
-                seed=1000 + idx,
-            ))
-
-        return instances
-
-    def _build_instance(self, name: str, n_customers: int, n_products: int, seed: int) -> Dict:
-        rng = random.Random(seed)
-        scaled_capacity = n_products * 500
-
-        coords = [(rng.uniform(-50, 50), rng.uniform(-50, 50)) for _ in range(n_customers)]
-
-        customers = []
-        for cid in range(n_customers):
-            demand = {p + 1: rng.randint(1, 5) * 50 for p in range(n_products)}
-            customers.append({
-                "id": cid,
-                "x": coords[cid][0],
-                "y": coords[cid][1],
-                "demand": demand,
-                "time_window": [0, 1000],
-                "service_time": 10,
-            })
-
-        vehicle = {
-            "compartments": create_compartments(n_products, scaled_capacity),
-            **VEHICLE_CONFIG,
-            "max_payload": scaled_capacity,
-            "max_volume": scaled_capacity,
-            "product_densities": get_product_densities(n_products),
-        }
-
-        return {
-            "name": name,
-            "customers": customers,
-            "time_windows": [[0.0, 1000.0, 10.0]] * n_customers,
-            "vehicle": vehicle,
-            "distance_matrix": compute_distance_matrix([(0, 0)] + coords),
-            "metadata": {
-                "source": SOURCE_INFO["mirzaei"]["name"],
-                "source_doi": SOURCE_INFO["mirzaei"]["doi"],
-                "layer": "mirzaei",
-                "n_customers": n_customers,
-                "n_commodities": n_products,
-                "n_compartments": n_products,
-                "scaled_capacity": scaled_capacity,
-                "generated": datetime.now().isoformat(),
-            },
-        }
-
-
-# ============================================================================
-# MAIN GENERATOR
-# ============================================================================
-
-class DSCCTRPStandardGenerator:
-    """Orchestrate generation of the full 100-instance benchmark."""
-
-    def __init__(self, output_dir: str):
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.summary = {
-            "paixao": {"count": 0, "names": []},
-            "mirzaei": {"count": 0, "names": []},
-            "total": 0,
-        }
-
-    def generate_all(self) -> None:
-        print("=" * 80)
-        print("DSC-CTRP STANDARD INSTANCE GENERATOR")
-        print("=" * 80)
-        print(f"Output directory: {self.output_dir}")
-        print("-" * 80)
-
-        print("\n[1/2] Generating Paixao layer (15 instances)...")
-        self._save(PaixaoInstanceGenerator(self.output_dir).generate_all(), "paixao")
-
-        print("\n[2/2] Generating Mirzaei layer (85 instances)...")
-        self._save(MirzaeiInstanceGenerator(self.output_dir).generate_all(), "mirzaei")
-
-        self._print_summary()
-        self._save_summary()
-
-    def _save(self, instances: List[Dict], layer: str) -> None:
-        for instance in instances:
-            path = os.path.join(self.output_dir, f"{instance['name']}.json")
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(instance, fh, indent=2)
-            self.summary[layer]["count"] += 1
-            self.summary[layer]["names"].append(instance["name"])
-            self.summary["total"] += 1
-        print(f"  Generated {len(instances)} {layer} instances")
-
-    def _print_summary(self) -> None:
-        print("\n" + "=" * 80)
-        print("GENERATION COMPLETE")
-        print("=" * 80)
-        print(f"Total instances: {self.summary['total']}")
-        print(f"  Paixao layer:  {self.summary['paixao']['count']}")
-        print(f"  Mirzaei layer: {self.summary['mirzaei']['count']}")
-        print(f"Output: {self.output_dir}")
-        print("=" * 80)
-
-    def _save_summary(self) -> None:
-        path = os.path.join(self.output_dir, "generation_summary.json")
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({
-                "total": self.summary["total"],
-                "by_layer": {
-                    "paixao": self.summary["paixao"],
-                    "mirzaei": self.summary["mirzaei"],
-                },
-                "generated": datetime.now().isoformat(),
-            }, fh, indent=2)
-        print(f"Summary written to {path}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate the DSC-CTRP benchmark.")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR,
-                        help="Directory in which to write the JSON instances.")
-    args = parser.parse_args()
-
-    DSCCTRPStandardGenerator(args.output).generate_all()
+def main():
+    ap = argparse.ArgumentParser(description="DSC-CTRP standard instance generator")
+    ap.add_argument("--output", default="benchmark_instances")
+    ap.add_argument("--num", type=int, default=100)
+    args = ap.parse_args()
+    generate_benchmark(args.output, args.num)
 
 
 if __name__ == "__main__":
